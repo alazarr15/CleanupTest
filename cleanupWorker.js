@@ -61,48 +61,53 @@ async function startWorker() {
 
 
 // --- Logic for Lobby Phase Cleanup ---
-async function processLobbyCleanup(job, redis) {
-    const { telegramId, gameId, gameSessionId } = job;
-    console.log(`   -> Executing LOBBY cleanup for ${telegramId}`);
+    async function processLobbyCleanup(job, redis) {
+        const { telegramId, gameId, gameSessionId } = job;
+        console.log(`   -> Executing LOBBY cleanup for ${telegramId}`);
 
-    // Release card in DB and Redis
-    const dbCard = await GameCard.findOneAndUpdate(
-        { gameId, takenBy: telegramId },
-        { $set: { isTaken: false, takenBy: null } },
-        { new: true }
-    );
-
-    if (dbCard) {
-        await redis.hDel(`gameCards:${gameId}`, String(dbCard.cardId));
-        console.log(`   -> Card ${dbCard.cardId} released.`);
-    }
-
-    // Check if the lobby is now completely empty
-    const playerCount = await redis.sCard(`gamePlayers:${gameId}`); 
-
-    if (playerCount === 0) {
-        
-        // 1. Update GameControl in DB (Mark as ended)
-        await GameControl.findOneAndUpdate(
-            { gameId, endedAt: null },
-            { $set: { isActive: false, endedAt: new Date(), players: [] } }
+        // 1. Release card in DB and Redis
+        const dbCard = await GameCard.findOneAndUpdate(
+            { gameId, takenBy: telegramId },
+            { $set: { isTaken: false, takenBy: null } },
+            { new: true }
         );
-        
-        // 2. Cleanup Redis keys specific to the lobby phase (if any)
-        await redis.del(`gameCards:${gameId}`);
-        console.log(`   -> Game ${gameId} is now empty and has been marked as ended in DB.`);
-        
-        // 3. 🟢 PUBLISH the 'fullGameReset' command to the API server (The Missing Step)
-        const resetEvent = JSON.stringify({
-            event: 'fullGameReset', // The signal caught by index.js
-            gameId: gameId,
-            gameSessionId: gameSessionId 
-        });
-        
-        await redis.publish('game-events', resetEvent);
-        console.log(`   -> Published 'fullGameReset' event for game ${gameId} to API.`);
+
+        if (dbCard) {
+            // ✅ Ensure this is awaited
+            await redis.hDel(`gameCards:${gameId}`, String(dbCard.cardId)); 
+            console.log(`   -> Card ${dbCard.cardId} released.`);
+        }
+
+        // 2. Check if the lobby is now completely empty
+        // ✅ Ensure redis.sCard is awaited
+        const playerCount = await redis.sCard(`gamePlayers:${gameId}`); 
+
+        if (playerCount === 0) {
+            
+            // 3. Update GameControl in DB (Mark as ended)
+            // ✅ Ensure this is awaited
+            await GameControl.findOneAndUpdate(
+                { gameId, endedAt: null },
+                { $set: { isActive: false, endedAt: new Date(), players: [] } }
+            );
+            
+            // 4. Cleanup Redis keys specific to the lobby phase
+            // ✅ Ensure this is awaited
+            await redis.del(`gameCards:${gameId}`); 
+            console.log(`   -> Game ${gameId} is now empty and has been marked as ended in DB.`);
+            
+            // 5. PUBLISH the 'fullGameReset' command to the API server
+            const resetEvent = JSON.stringify({
+                event: 'fullGameReset', // The signal caught by index.js
+                gameId: gameId,
+                gameSessionId: gameSessionId 
+            });
+            
+            // ✅ Ensure this is awaited
+            await redis.publish('game-events', resetEvent); 
+            console.log(`   -> Published 'fullGameReset' event for game ${gameId} to API.`);
+        }
     }
-}
 
 
 // --- Logic for Join Game (Live Game) Phase Cleanup ---
