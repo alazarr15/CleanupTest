@@ -75,7 +75,7 @@ async function processLobbyCleanup(job, redis) {
     if (dbCard) {
         await redis.hDel(`gameCards:${gameId}`, String(dbCard.cardId));
         console.log(`   -> Card ${dbCard.cardId} released.`);
-    }Gamereset
+    }
     const playerCount = await redis.sCard(`gamePlayers:${gameId}`);
     if (playerCount === 0) {
         await GameControl.findOneAndUpdate(
@@ -126,7 +126,7 @@ async function processJoinGameCleanup(job, redis) {
             console.log(`   -> All live players left game ${gameId}. Marked game as ended.`);
              // 2. 🟢 PUBLISH the 'fullGameReset' command to the API server
         const resetEvent = JSON.stringify({
-            event: 'gameReset', // Use a specific event name for the full reset
+            event: 'fullGameReset', // Use a specific event name for the full reset
             gameId: gameId,
             gameSessionId: gameSessionId // Pass all data needed for the remote function
         });
