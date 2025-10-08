@@ -63,7 +63,7 @@ async function startWorker() {
 // --- Logic for Lobby Phase Cleanup ---
 async function processLobbyCleanup(job, redis) {
     const { telegramId, gameId, gameSessionId } = job;
-    console.log(`   -> Executing LOBBY cleanup for ${telegramId}`);
+    console.log(`   -> Executing LOBBY cleanup for ${telegramId}`);
 
     // Release card in DB and Redis
     const dbCard = await GameCard.findOneAndUpdate(
@@ -74,18 +74,33 @@ async function processLobbyCleanup(job, redis) {
 
     if (dbCard) {
         await redis.hDel(`gameCards:${gameId}`, String(dbCard.cardId));
-        console.log(`   -> Card ${dbCard.cardId} released.`);
+        console.log(`   -> Card ${dbCard.cardId} released.`);
     }
-    const playerCount = await redis.sCard(`gamePlayers:${gameId}`);
+
+    // Check if the lobby is now completely empty
+    const playerCount = await redis.sCard(`gamePlayers:${gameId}`); 
+
     if (playerCount === 0) {
+        
+        // 1. Update GameControl in DB (Mark as ended)
         await GameControl.findOneAndUpdate(
             { gameId, endedAt: null },
             { $set: { isActive: false, endedAt: new Date(), players: [] } }
         );
-        // Note: The original resetGame util might need refactoring if it depends on `io`
-        // For the worker, we focus on DB state cleanup.
+        
+        // 2. Cleanup Redis keys specific to the lobby phase (if any)
         await redis.del(`gameCards:${gameId}`);
-        console.log(`   -> Game ${gameId} is now empty and has been marked as ended.`);
+        console.log(`   -> Game ${gameId} is now empty and has been marked as ended in DB.`);
+        
+        // 3. 🟢 PUBLISH the 'fullGameReset' command to the API server (The Missing Step)
+        const resetEvent = JSON.stringify({
+            event: 'fullGameReset', // The signal caught by index.js
+            gameId: gameId,
+            gameSessionId: gameSessionId 
+        });
+        
+        await redis.publish('game-events', resetEvent);
+        console.log(`   -> Published 'fullGameReset' event for game ${gameId} to API.`);
     }
 }
 
