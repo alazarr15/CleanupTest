@@ -126,7 +126,7 @@ async function processJoinGameCleanup(job, redis) {
             console.log(`   -> All live players left game ${gameId}. Marked game as ended.`);
              // 2. 🟢 PUBLISH the 'fullGameReset' command to the API server
         const resetEvent = JSON.stringify({
-            event: 'fullGameReset', // Use a specific event name for the full reset
+            event: 'gameReset', // Use a specific event name for the full reset
             gameId: gameId,
             gameSessionId: gameSessionId // Pass all data needed for the remote function
         });
