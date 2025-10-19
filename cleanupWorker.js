@@ -84,7 +84,7 @@ async function processLobbyCleanup(job, redis) {
         });
  
         await redis.publish('game-events', cardReleaseEvent);
-        console.log("sent cardReleased event to index");
+        console.log(`   -> Published 'cardReleased' event for card ${dbCard.cardId} to 'game-events' channel.`);
     }
 
     // 2. Check if the lobby is now completely empty
