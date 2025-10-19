@@ -83,7 +83,7 @@ async function processLobbyCleanup(job, redis) {
             releasedBy: telegramId // The user who left
         });
  
-        await redis.publish('cardReleased', cardReleaseEvent);
+        await redis.publish('game-events', cardReleaseEvent);
         console.log("sent cardReleased event to index");
     }
 
