@@ -75,6 +75,16 @@ async function processLobbyCleanup(job, redis) {
     if (dbCard) {
         await redis.hDel(`gameCards:${gameId}`, String(dbCard.cardId)); 
         console.log(`   -> Card ${dbCard.cardId} released.`);
+
+        const cardReleaseEvent = JSON.stringify({
+            event: 'cardReleased', // The new event name
+            gameId: gameId,
+            cardId: dbCard.cardId, // The specific card that was released
+            releasedBy: telegramId // The user who left
+        });
+ 
+        await redis.publish('cardReleased', cardReleaseEvent);
+        console.log("sent cardReleased event to index");
     }
 
     // 2. Check if the lobby is now completely empty
