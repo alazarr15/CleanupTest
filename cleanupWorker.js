@@ -8,10 +8,8 @@ const User = require("./models/user");
 const GameControl = require("./models/GameControl");
 const GameCard = require('./models/GameCard');
 const PlayerSession = require("./models/PlayerSession");
-const resetGame = require("./utils/resetGame"); // This is just for reference/import structure
-// ⚠️ Note: The resetGame function should NOT be called directly here; the signal is sent via Redis Pub/Sub.
 
-console.log("🛠️  Starting disconnect cleanup worker...");
+console.log("🛠️  Starting disconnect cleanup worker...");
 
 // --- Main Worker Logic ---
 async function startWorker() {
@@ -36,7 +34,7 @@ async function startWorker() {
                 const jobPayload = result.element;
                 const job = JSON.parse(jobPayload);
 
-                console.log(`\n▶️  Processing job for User: ${job.telegramId}, Game: ${job.gameId}, Phase: ${job.phase}`);
+                console.log(`\n▶️  Processing job for User: ${job.telegramId}, Game: ${job.gameId}, Phase: ${job.phase}`);
 
                 // 4. Route the job to the correct cleanup logic based on the phase
                 if (job.phase === 'lobby') {
@@ -60,59 +58,85 @@ async function startWorker() {
 }
 
 
-// --- Logic for Lobby Phase Cleanup (CRITICALLY UPDATED) ---
+// --- Logic for Lobby Phase Cleanup (UPDATED FOR MULTI-CARD) ---
 async function processLobbyCleanup(job, redis) {
     const { telegramId, gameId, gameSessionId } = job;
-    console.log(`   -> Executing LOBBY cleanup for ${telegramId}`);
+    const strTelegramId = String(telegramId);
+    console.log(`   -> Executing LOBBY cleanup for ${telegramId}`);
 
-    // 1. Release card in DB and Redis
-    const dbCard = await GameCard.findOneAndUpdate(
-        { gameId, takenBy: telegramId },
-        { $set: { isTaken: false, takenBy: null } },
-        { new: true }
-    );
+    try {
+        // 1. Find ALL cards currently held by this user in this game
+        // We query the DB to get the authoritative list of cards to release
+        const userCards = await GameCard.find(
+            { gameId: gameId, takenBy: strTelegramId }
+        ).select('cardId');
 
-    if (dbCard) {
-        await redis.hDel(`gameCards:${gameId}`, String(dbCard.cardId)); 
-        console.log(`   -> Card ${dbCard.cardId} released.`);
+        const cardIdsToRelease = userCards.map(c => c.cardId);
 
-        const cardReleaseEvent = JSON.stringify({
-            event: 'cardReleased', // The new event name
-            gameId: gameId,
-            cardId: dbCard.cardId, // The specific card that was released
-            releasedBy: telegramId // The user who left
-        });
- 
-        await redis.publish('game-events', cardReleaseEvent);
-        console.log(`   -> Published 'cardReleased' event for card ${dbCard.cardId} to 'game-events' channel.`);
-    }
+        if (cardIdsToRelease.length > 0) {
+            console.log(`   -> Found ${cardIdsToRelease.length} cards to release: ${cardIdsToRelease.join(', ')}`);
 
-    // 2. Check if the lobby is now completely empty
-    const playerCount = await redis.sCard(`gamePlayers:${gameId}`); 
+            // 2. Batch Release in MongoDB
+            // Releases all cards owned by this user for this gameId
+            await GameCard.updateMany(
+                { gameId: gameId, takenBy: strTelegramId },
+                { $set: { isTaken: false, takenBy: null } }
+            );
 
-    if (playerCount === 0) {
-        
-        // 3. Update GameControl in DB (Mark as ended)
-        // ✅ FIX: Added { maxTimeMS: 5000 } to prevent indefinite hangs
-        await GameControl.findOneAndUpdate(
-            { gameId, endedAt: null },
-            { $set: { isActive: false, endedAt: new Date(), players: [] } },
-            { maxTimeMS: 5000 } 
-        );
-        
-        // 4. Cleanup Redis keys specific to the lobby phase
-        await redis.del(`gameCards:${gameId}`); 
-        console.log(`   -> Game ${gameId} is now empty and has been marked as ended in DB.`);
-        
-        // 5. PUBLISH the 'fullGameReset' command to the API server
-        const resetEvent = JSON.stringify({
-            event: 'fullGameReset', 
-            gameId: gameId,
-            gameSessionId: gameSessionId 
-        });
-        
-        await redis.publish('game-events', resetEvent); 
-        console.log(`   -> Published 'fullGameReset' event for game ${gameId} to API.`);
+            // 3. Batch Release in Redis
+            // We convert IDs to strings to ensure they match Redis hash keys
+            const redisFields = cardIdsToRelease.map(String);
+            
+            // Remove all specific card keys from the game hash
+            if (redisFields.length > 0) {
+                await redis.hDel(`gameCards:${gameId}`, ...redisFields);
+            }
+            console.log(`   -> Deleted cards from Redis hash.`);
+
+            // 4. Publish 'cardsReleased' event (Note: Plural 'cards')
+            // This tells the API/Socket server to emit the event to the frontend
+            const cardReleaseEvent = JSON.stringify({
+                event: 'cardsReleased', // Updated event name to match socket logic
+                gameId: gameId,
+                cardIds: cardIdsToRelease, // Send the ARRAY of IDs
+                releasedBy: strTelegramId
+            });
+
+            await redis.publish('game-events', cardReleaseEvent);
+            console.log(`   -> Published 'cardsReleased' event to 'game-events' channel.`);
+        } else {
+            console.log(`   -> No cards found for user ${telegramId} to release.`);
+        }
+
+        // 5. Check if the lobby is now completely empty
+        const playerCount = await redis.sCard(`gamePlayers:${gameId}`); 
+
+        if (playerCount === 0) {
+            
+            // 6. Update GameControl in DB (Mark as ended)
+            await GameControl.findOneAndUpdate(
+                { gameId, endedAt: null },
+                { $set: { isActive: false, endedAt: new Date(), players: [] } },
+                { maxTimeMS: 5000 } 
+            );
+            
+            // 7. Cleanup Redis keys specific to the lobby phase
+            await redis.del(`gameCards:${gameId}`); 
+            console.log(`   -> Game ${gameId} is now empty and has been marked as ended in DB.`);
+            
+            // 8. PUBLISH the 'fullGameReset' command to the API server
+            const resetEvent = JSON.stringify({
+                event: 'fullGameReset', 
+                gameId: gameId,
+                gameSessionId: gameSessionId 
+            });
+            
+            await redis.publish('game-events', resetEvent); 
+            console.log(`   -> Published 'fullGameReset' event for game ${gameId} to API.`);
+        }
+
+    } catch (error) {
+        console.error(`❌ Error in processLobbyCleanup for ${telegramId}:`, error);
     }
 }
 
@@ -120,52 +144,56 @@ async function processLobbyCleanup(job, redis) {
 // --- Logic for Join Game (Live Game) Phase Cleanup ---
 async function processJoinGameCleanup(job, redis) {
     const { telegramId, gameId, gameSessionId } = job;
-    console.log(`   -> Executing JOIN_GAME cleanup for ${telegramId}`);
+    console.log(`   -> Executing JOIN_GAME cleanup for ${telegramId}`);
 
-    // If a game is active, we just mark the player as disconnected.
-    await PlayerSession.updateOne(
-        { GameSessionId: gameSessionId, telegramId },
-        { $set: { status: 'disconnected' } }
-    );
-    console.log(`   -> Marked ${telegramId} as 'disconnected' in PlayerSession.`);
+    try {
+        // If a game is active, we just mark the player as disconnected.
+        await PlayerSession.updateOne(
+            { GameSessionId: gameSessionId, telegramId },
+            { $set: { status: 'disconnected' } }
+        );
+        console.log(`   -> Marked ${telegramId} as 'disconnected' in PlayerSession.`);
 
-    // Remove the player from the *live* room count in Redis
-    await redis.sRem(`gameRooms:${gameId}`, telegramId);
-    console.log(`   -> Removed ${telegramId} from Redis live room.`);
+        // Remove the player from the *live* room count in Redis
+        await redis.sRem(`gameRooms:${gameId}`, telegramId);
+        console.log(`   -> Removed ${telegramId} from Redis live room.`);
 
-    // Clear user's balance reservation in the DB
-    await User.updateOne(
-        { telegramId, reservedForGameId: gameId },
-        { $unset: { reservedForGameId: "" } }
-    );
-    console.log(`   -> Cleared balance reservation for ${telegramId}.`);
+        // Clear user's balance reservation in the DB
+        await User.updateOne(
+            { telegramId, reservedForGameId: gameId },
+            { $unset: { reservedForGameId: "" } }
+        );
+        console.log(`   -> Cleared balance reservation for ${telegramId}.`);
 
-    // Check if the live game is now empty
-    const livePlayerCount = await redis.sCard(`gameRooms:${gameId}`);
-    if (livePlayerCount === 0 && gameSessionId !== 'NO_SESSION_ID') {
-        const game = await GameControl.findOne({ GameSessionId: gameSessionId, endedAt: null });
-        if (game && game.isActive) {
-             // 🚨 CRITICAL FIX: Add { maxTimeMS: 5000 } to prevent indefinite hang
-             await GameControl.updateOne(
-                { GameSessionId: gameSessionId },
-                { $set: { endedAt: new Date() } },
-                { maxTimeMS: 5000 }
-            );
-            console.log(`   -> All live players left game ${gameId}. Marked game as ended.`);
-             // 🟢 PUBLISH the 'fullGameReset' command to the API server
-            const resetEvent = JSON.stringify({
-                event: 'fullGameReset', // Use a specific event name for the full reset
-                gameId: gameId,
-                gameSessionId: gameSessionId
-            });
-            
-            await redis.publish('game-events', resetEvent);
-            console.log(`   -> Published 'fullGameReset' event for game ${gameId} to API.`);
+        // Check if the live game is now empty
+        const livePlayerCount = await redis.sCard(`gameRooms:${gameId}`);
+        if (livePlayerCount === 0 && gameSessionId !== 'NO_SESSION_ID') {
+            const game = await GameControl.findOne({ GameSessionId: gameSessionId, endedAt: null });
+            if (game && game.isActive) {
+                 // 🚨 CRITICAL FIX: Add { maxTimeMS: 5000 } to prevent indefinite hang
+                 await GameControl.updateOne(
+                    { GameSessionId: gameSessionId },
+                    { $set: { endedAt: new Date() } },
+                    { maxTimeMS: 5000 }
+                );
+                console.log(`   -> All live players left game ${gameId}. Marked game as ended.`);
+                 // 🟢 PUBLISH the 'fullGameReset' command to the API server
+                const resetEvent = JSON.stringify({
+                    event: 'fullGameReset', // Use a specific event name for the full reset
+                    gameId: gameId,
+                    gameSessionId: gameSessionId
+                });
+                
+                await redis.publish('game-events', resetEvent);
+                console.log(`   -> Published 'fullGameReset' event for game ${gameId} to API.`);
+            }
         }
+    } catch (error) {
+        console.error(`❌ Error in processJoinGameCleanup for ${telegramId}:`, error);
     }
 }
 
-// --- Global Error Handlers (CRITICALLY ADDED) ---
+// --- Global Error Handlers ---
 // Prevents the Node.js process from silently crashing on unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
     console.error('❌ UNHANDLED REJECTION in Worker:', reason);
@@ -176,7 +204,6 @@ process.on('unhandledRejection', (reason, promise) => {
 process.on('uncaughtException', (err) => {
     console.error('❌ UNCAUGHT EXCEPTION in Worker:', err);
     // CapRover will restart the container automatically
-    // You may choose to exit here, but logging and letting CapRover handle restart is often sufficient.
 });
 
 // --- Start the worker process ---
