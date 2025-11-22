@@ -58,84 +58,95 @@ async function startWorker() {
 }
 
 
-// --- Logic for Lobby Phase Cleanup (UPDATED FOR MULTI-CARD) ---
-    async function processLobbyCleanup(job, redis) {
-        const { telegramId, gameId, gameSessionId } = job;
-        const strTelegramId = String(telegramId);
-        const strGameId = String(gameId);
-        console.log(`   -> Executing LOBBY cleanup for ${telegramId}`);
+  // --- Logic for Lobby Phase Cleanup (UPDATED TO MATCH playerLeave) ---
+async function processLobbyCleanup(job, redis) {
+    const { telegramId, gameId, gameSessionId } = job;
+    // ✅ Trim the ID just like playerLeave
+    const strTelegramId = String(telegramId).trim(); 
+    const strGameId = String(gameId);
+    
+    console.log(`   -> Executing LOBBY cleanup for ${telegramId}`);
 
-        try {
-            const gameCardsKey = `gameCards:${strGameId}`;
+    try {
+        const gameCardsKey = `gameCards:${strGameId}`;
 
-            // 1. REDIS CLEANUP: Scan Redis directly for ANY cards owned by this user
-            // (This matches the logic in playerLeave to catch sync errors)
-            const allGameCards = await redis.hGetAll(gameCardsKey);
-            const cardsToRelease = [];
-            
-            for (const [cId, owner] of Object.entries(allGameCards)) {
-                if (String(owner) === strTelegramId) {
-                    cardsToRelease.push(cId);
-                }
-            }
+        // 1. REDIS CLEANUP: Scan Redis directly (Source of Truth)
+        const allGameCards = await redis.hGetAll(gameCardsKey);
+        
+        // ✅ Filter using trim() to ensure we catch the cards
+        const cardsToRelease = Object.entries(allGameCards)
+            .filter(([_, ownerId]) => String(ownerId).trim() == strTelegramId)
+            .map(([cardId]) => cardId);
 
-            if (cardsToRelease.length > 0) {
-                console.log(`   -> Found ${cardsToRelease.length} cards in Redis to release: ${cardsToRelease.join(', ')}`);
+        if (cardsToRelease.length > 0) {
+            console.log(`   -> Found ${cardsToRelease.length} cards in Redis to release: ${cardsToRelease.join(', ')}`);
 
-                // A) Remove from Redis Hash
-                await redis.hDel(gameCardsKey, ...cardsToRelease);
+            // A) Remove from Redis
+            await redis.hDel(gameCardsKey, ...cardsToRelease);
 
-                // B) Update MongoDB (Set isTaken: false)
-                await GameCard.updateMany(
-                    { gameId: strGameId, cardId: { $in: cardsToRelease.map(Number) } },
-                    { $set: { isTaken: false, takenBy: null } }
-                );
+            // B) Update MongoDB 
+            await GameCard.updateMany(
+                { gameId: strGameId, cardId: { $in: cardsToRelease.map(Number) } },
+                { $set: { isTaken: false, takenBy: null } }
+            );
 
-                // C) Publish event for the frontend
-                const cardReleaseEvent = JSON.stringify({
-                    event: 'cardsReleased', 
-                    gameId: strGameId,
-                    cardIds: cardsToRelease, 
-                    releasedBy: strTelegramId
-                });
-
-                await redis.publish('game-events', cardReleaseEvent);
-                console.log(`   -> Published 'cardsReleased' event.`);
-            }
-
-            // 2. SET CLEANUP: Remove player from the tracking Sets
-            // (This was missing and caused the lobby to think the player was still there)
-            await Promise.all([
-                redis.sRem(`gameSessions:${strGameId}`, strTelegramId),
-                redis.sRem(`gameRooms:${strGameId}`, strTelegramId)
-            ]);
-            console.log(`   -> Removed ${strTelegramId} from gameSessions and gameRooms sets.`);
-
-            // 3. Check if the lobby is now completely empty
-            const playerCount = await redis.sCard(`gameSessions:${strGameId}`); // Check Sessions, not Players key
-
-            if (playerCount === 0) {
-                await GameControl.findOneAndUpdate(
-                    { gameId: strGameId, endedAt: null },
-                    { $set: { isActive: false, endedAt: new Date(), players: [] } },
-                    { maxTimeMS: 5000 } 
-                );
+            // ✅ Double-Check for leftovers (Race Condition Fix)
+            const verifyCards = await redis.hGetAll(gameCardsKey);
+            const leftovers = Object.entries(verifyCards)
+                .filter(([_, ownerId]) => String(ownerId).trim() == strTelegramId)
+                .map(([cardId]) => cardId);
                 
-                await redis.del(gameCardsKey); 
-                console.log(`   -> Game ${strGameId} is now empty. Cleaning up.`);
-                
-                const resetEvent = JSON.stringify({
-                    event: 'fullGameReset', 
-                    gameId: strGameId,
-                    gameSessionId: gameSessionId 
-                });
-                await redis.publish('game-events', resetEvent); 
+            if (leftovers.length > 0) {
+                console.log(`   -> ⚠️ Worker found leftovers, deleting again: ${leftovers.join(', ')}`);
+                await redis.hDel(gameCardsKey, ...leftovers);
+                cardsToRelease.push(...leftovers);
             }
 
-        } catch (error) {
-            console.error(`❌ Error in processLobbyCleanup for ${telegramId}:`, error);
+            // C) Publish Event
+            const cardReleaseEvent = JSON.stringify({
+                event: 'cardsReleased', 
+                gameId: strGameId,
+                cardIds: cardsToRelease, 
+                releasedBy: strTelegramId
+            });
+
+            await redis.publish('game-events', cardReleaseEvent);
+            console.log(`   -> Published 'cardsReleased' event.`);
         }
+
+        // 2. SET CLEANUP: Remove from BOTH sets
+        await Promise.all([
+            redis.sRem(`gameSessions:${strGameId}`, strTelegramId),
+            redis.sRem(`gameRooms:${strGameId}`, strTelegramId)
+        ]);
+        console.log(`   -> Removed ${strTelegramId} from gameSessions and gameRooms sets.`);
+
+        // 3. Check if empty
+        const playerCount = await redis.sCard(`gameRooms:${strGameId}`); 
+
+        if (playerCount === 0) {
+            await GameControl.findOneAndUpdate(
+                { gameId: strGameId, endedAt: null },
+                { $set: { isActive: false, endedAt: new Date(), players: [] } },
+                { maxTimeMS: 5000 } 
+            );
+            
+            // Safe Nuke of the key
+            await redis.del(gameCardsKey); 
+            console.log(`   -> Game ${strGameId} is now empty. Fully cleaned Redis key.`);
+            
+            const resetEvent = JSON.stringify({
+                event: 'fullGameReset', 
+                gameId: strGameId,
+                gameSessionId: gameSessionId 
+            });
+            await redis.publish('game-events', resetEvent); 
+        }
+
+    } catch (error) {
+        console.error(`❌ Error in processLobbyCleanup for ${telegramId}:`, error);
     }
+}
 
 
 // --- Logic for Join Game (Live Game) Phase Cleanup ---
