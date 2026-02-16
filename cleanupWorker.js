@@ -9,6 +9,7 @@ const User = require("./models/user");
 const GameControl = require("./models/GameControl");
 const GameCard = require('./models/GameCard');
 const PlayerSession = require("./models/PlayerSession");
+const { findFieldsByValue } = require("./utils/redisHelpers");
 
 console.log("🛠️  Starting disconnect cleanup worker...");
 
@@ -43,6 +44,7 @@ async function startWorker() {
                     await processLobbyCleanup(job, redis);
                 } else if (job.phase === 'joinGame') {
                     await processJoinGameCleanup(job, redis);
+                     await processLobbyCleanup(job, redis);
                 } else {
                     console.warn(`⚠️ Unknown job phase received: ${job.phase}`);
                 }
@@ -65,17 +67,15 @@ async function processLobbyCleanup(job, redis) {
     const { telegramId, gameId, gameSessionId } = job;
     const strTelegramId = String(telegramId).trim(); 
     const strGameId = String(gameId);
+
     
     console.log(`   -> Executing LOBBY cleanup for ${telegramId}`);
 
     try {
         const gameCardsKey = `gameCards:${strGameId}`;
 
-        const allGameCards = await redis.hGetAll(gameCardsKey);
-        
-        const cardsToRelease = Object.entries(allGameCards)
-            .filter(([_, ownerId]) => String(ownerId).trim() == strTelegramId)
-            .map(([cardId]) => cardId);
+        const cardsToRelease = await findFieldsByValue(redis, gameCardsKey, strTelegramId);
+
 
         if (cardsToRelease.length > 0) {
             console.log(`   -> Found ${cardsToRelease.length} cards in Redis to release: ${cardsToRelease.join(', ')}`);
@@ -87,16 +87,12 @@ async function processLobbyCleanup(job, redis) {
                 { $set: { isTaken: false, takenBy: null } }
             );
 
-            const verifyCards = await redis.hGetAll(gameCardsKey);
-            const leftovers = Object.entries(verifyCards)
-                .filter(([_, ownerId]) => String(ownerId).trim() == strTelegramId)
-                .map(([cardId]) => cardId);
-                
-            if (leftovers.length > 0) {
-                console.log(`   -> ⚠️ Worker found leftovers, deleting again: ${leftovers.join(', ')}`);
-                await redis.hDel(gameCardsKey, ...leftovers);
-                cardsToRelease.push(...leftovers);
-            }
+                // Optional: verify leftovers (you can keep this, but now using HSCAN too)
+                const leftovers = await findFieldsByValue(redis, gameCardsKey, strTelegramId);
+                if (leftovers.length > 0) {
+                    console.warn(`Leftovers after release: ${leftovers.join(', ')}`);
+                    await redis.hDel(gameCardsKey, ...leftovers);
+                }
 
             const cardReleaseEvent = JSON.stringify({
                 event: 'cardsReleased', 
