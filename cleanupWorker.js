@@ -73,15 +73,20 @@ async function processLobbyCleanup(job, redis) {
 
     try {
         const gameCardsKey = `gameCards:${strGameId}`;
+        const takenCardsKey = `takenCards:${strGameId}`; // 🆕 The Global Set
+        const userHeldCardsKey = `userHeldCards:${strGameId}:${strTelegramId}`; // 🆕 The User Set
 
-        const cardsToRelease = await findFieldsByValue(redis, gameCardsKey, strTelegramId);
+        const cardsToRelease = await redis.lRange(userHeldCardsKey, 0, -1)
 
 
         if (cardsToRelease.length > 0) {
             console.log(`   -> Found ${cardsToRelease.length} cards in Redis to release: ${cardsToRelease.join(', ')}`);
 
-            await redis.hDel(gameCardsKey, ...cardsToRelease);
-
+            const multi = redis.multi();
+            multi.hDel(gameCardsKey, ...cardsToRelease);     // Remove Owner mapping
+            multi.sRem(takenCardsKey, ...cardsToRelease);    // Make available for others
+            multi.del(userHeldCardsKey);                     // Delete the user's pocket
+            await multi.exec();
             await GameCard.updateMany(
                 { gameId: strGameId, cardId: { $in: cardsToRelease.map(Number) } },
                 { $set: { isTaken: false, takenBy: null } }
@@ -121,6 +126,7 @@ async function processLobbyCleanup(job, redis) {
             );
             
             await redis.del(gameCardsKey); 
+            await redis.del(takenCardsKey);
             console.log(`   -> Game ${strGameId} is now empty. Fully cleaned Redis key.`);
             
             const resetEvent = JSON.stringify({
