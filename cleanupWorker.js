@@ -64,82 +64,101 @@ async function startWorker() {
 
 // --- Logic for Lobby Phase Cleanup ---
 async function processLobbyCleanup(job, redis) {
-    const { telegramId, gameId, gameSessionId } = job;
-    const strTelegramId = String(telegramId).trim(); 
-    const strGameId = String(gameId);
+  const { telegramId, gameId, gameSessionId } = job;
+  const strTelegramId = String(telegramId).trim();
+  const strGameId = String(gameId);
 
-    
-    console.log(`   -> Executing LOBBY cleanup for ${telegramId}`);
+  console.log(`   -> Executing LOBBY cleanup for ${telegramId}`);
+
+  try {
+    const gameCardsKey = `gameCards:${strGameId}`;
+    const takenCardsKey = `takenCards:${strGameId}`;
+    const userHeldCardsKey = `userHeldCards:${strGameId}:${strTelegramId}`;
+
+    const cardsToRelease = await redis.lRange(userHeldCardsKey, 0, -1);
+
+    if (cardsToRelease.length > 0) {
+      console.log(`   -> Found ${cardsToRelease.length} cards in Redis to release: ${cardsToRelease.join(', ')}`);
+
+      const multi = redis.multi();
+      multi.hDel(gameCardsKey, ...cardsToRelease);
+      multi.sRem(takenCardsKey, ...cardsToRelease);
+      multi.del(userHeldCardsKey);
+      await multi.exec();
+      await GameCard.updateMany(
+        { gameId: strGameId, cardId: { $in: cardsToRelease.map(Number) } },
+        { $set: { isTaken: false, takenBy: null } }
+      );
+
+      // Optional: verify leftovers
+      const leftovers = await findFieldsByValue(redis, gameCardsKey, strTelegramId);
+      if (leftovers.length > 0) {
+        console.warn(`Leftovers after release: ${leftovers.join(', ')}`);
+        await redis.hDel(gameCardsKey, ...leftovers);
+      }
+
+      const cardReleaseEvent = JSON.stringify({
+        event: 'cardsReleased',
+        gameId: strGameId,
+        cardIds: cardsToRelease,
+        releasedBy: strTelegramId
+      });
+
+      await redis.publish('game-events', cardReleaseEvent);
+      console.log(`   -> Published 'cardsReleased' event.`);
+    }
+
+    // 🔥 FIX: Lock for concurrent cleanups + use correct keys from join logic
+    const lockKey = `lock:lobbyCleanup:${strGameId}`;
+    const hasLock = await redis.set(lockKey, 'locked', { NX: true, EX: 5 });
+    if (!hasLock) {
+      console.log(`   -> Lock held, skipping duplicate cleanup for ${strTelegramId}`);
+      return;  // Or retry if needed
+    }
 
     try {
-        const gameCardsKey = `gameCards:${strGameId}`;
-        const takenCardsKey = `takenCards:${strGameId}`; // 🆕 The Global Set
-        const userHeldCardsKey = `userHeldCards:${strGameId}:${strTelegramId}`; // 🆕 The User Set
+      // Remove from correct sets (matching JoinedLobbyHandler)
+      await Promise.all([
+        redis.sRem(`gameSessions:${strGameId}`, strTelegramId),
+        redis.sRem(`gamePlayers:${strGameId}`, strTelegramId)  // Added this
+      ]);
+      console.log(`   -> Removed ${strTelegramId} from gameSessions and gamePlayers sets.`);
 
-        const cardsToRelease = await redis.lRange(userHeldCardsKey, 0, -1)
+      // Get counts from BOTH sets
+      const [sessionCount, playersCount] = await Promise.all([
+        redis.sCard(`gameSessions:${strGameId}`),
+        redis.sCard(`gamePlayers:${strGameId}`)
+      ]);
 
+      const totalPlayers = sessionCount + playersCount;  // Simple add (or use sUnion if overlaps are an issue)
 
-        if (cardsToRelease.length > 0) {
-            console.log(`   -> Found ${cardsToRelease.length} cards in Redis to release: ${cardsToRelease.join(', ')}`);
+      console.log(`   -> After removal: gameSessions=${sessionCount}, gamePlayers=${playersCount}, total=${totalPlayers}`);
 
-            const multi = redis.multi();
-            multi.hDel(gameCardsKey, ...cardsToRelease);     // Remove Owner mapping
-            multi.sRem(takenCardsKey, ...cardsToRelease);    // Make available for others
-            multi.del(userHeldCardsKey);                     // Delete the user's pocket
-            await multi.exec();
-            await GameCard.updateMany(
-                { gameId: strGameId, cardId: { $in: cardsToRelease.map(Number) } },
-                { $set: { isTaken: false, takenBy: null } }
-            );
+      if (totalPlayers === 0) {
+        await GameControl.findOneAndUpdate(
+          { gameId: strGameId, endedAt: null },
+          { $set: { isActive: false, endedAt: new Date(), players: [] } },
+          { maxTimeMS: 5000 }
+        );
 
-                // Optional: verify leftovers (you can keep this, but now using HSCAN too)
-                const leftovers = await findFieldsByValue(redis, gameCardsKey, strTelegramId);
-                if (leftovers.length > 0) {
-                    console.warn(`Leftovers after release: ${leftovers.join(', ')}`);
-                    await redis.hDel(gameCardsKey, ...leftovers);
-                }
+        await redis.del(gameCardsKey);
+        await redis.del(takenCardsKey);
+        console.log(`   -> Game ${strGameId} is now empty. Fully cleaned Redis keys.`);
 
-            const cardReleaseEvent = JSON.stringify({
-                event: 'cardsReleased', 
-                gameId: strGameId,
-                cardIds: cardsToRelease, 
-                releasedBy: strTelegramId
-            });
-
-            await redis.publish('game-events', cardReleaseEvent);
-            console.log(`   -> Published 'cardsReleased' event.`);
-        }
-
-        await Promise.all([
-            redis.sRem(`gameSessions:${strGameId}`, strTelegramId),
-            redis.sRem(`gameRooms:${strGameId}`, strTelegramId)
-        ]);
-        console.log(`   -> Removed ${strTelegramId} from gameSessions and gameRooms sets.`);
-
-        const playerCount = await redis.sCard(`gameRooms:${strGameId}`); 
-
-        if (playerCount === 0) {
-            await GameControl.findOneAndUpdate(
-                { gameId: strGameId, endedAt: null },
-                { $set: { isActive: false, endedAt: new Date(), players: [] } },
-                { maxTimeMS: 5000 } 
-            );
-            
-            await redis.del(gameCardsKey); 
-            await redis.del(takenCardsKey);
-            console.log(`   -> Game ${strGameId} is now empty. Fully cleaned Redis key.`);
-            
-            const resetEvent = JSON.stringify({
-                event: 'fullGameReset', 
-                gameId: strGameId,
-                gameSessionId: gameSessionId 
-            });
-            await redis.publish('game-events', resetEvent); 
-        }
-
-    } catch (error) {
-        console.error(`❌ Error in processLobbyCleanup for ${telegramId}:`, error);
+        const resetEvent = JSON.stringify({
+          event: 'fullGameReset',
+          gameId: strGameId,
+          gameSessionId: gameSessionId
+        });
+        await redis.publish('game-events', resetEvent);
+      }
+    } finally {
+      await redis.del(lockKey);  // Always release lock
     }
+
+  } catch (error) {
+    console.error(`❌ Error in processLobbyCleanup for ${telegramId}:`, error);
+  }
 }
 
 
