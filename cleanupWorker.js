@@ -33,7 +33,7 @@ async function startWorker() {
             try {
                 // Use BRPOP to wait for a job to appear in the list.
                 // This awaits, allowing the event loop to handle HTTP requests in the background
-                const result = await redis.brPop('disconnect-cleanup-queue', 0);
+                const result = await redis.brPop('disconnect-cleanup', 0);
                 const jobPayload = result.element;
                 const job = JSON.parse(jobPayload);
 
